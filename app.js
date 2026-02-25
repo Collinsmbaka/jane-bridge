@@ -101,7 +101,7 @@ async function airtableLookupUser(phone) {
     }
     return null
   } catch (err) {
-    console.log('Airtable lookup error:', err.message)
+    console.log('Airtable lookup error:', err.message, err.response?.data)
     return null
   }
 }
@@ -138,7 +138,7 @@ async function airtableCreateUser(phone, referrerAirtableId) {
       referrals_earned: 0,
     }
   } catch (err) {
-    console.log('Airtable create error:', err.message)
+    console.log('Airtable create error:', err.message, err.response?.data)
     return null
   }
 }
@@ -155,7 +155,7 @@ async function airtableUpdateUser(recordId, fields) {
       data: { fields },
     })
   } catch (err) {
-    console.log('Airtable update error:', err.message)
+    console.log('Airtable update error:', err.message, err.response?.data)
   }
 }
 
