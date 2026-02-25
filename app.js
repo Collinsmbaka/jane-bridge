@@ -262,6 +262,18 @@ setInterval(async () => {
   console.log(`Cache cleanup done. ${userCache.size} entries remain.`)
 }, 60 * 60 * 1000)
 
+// Graceful shutdown: sync all dirty cache entries before exit
+process.on('SIGTERM', async () => {
+  console.log('SIGTERM received. Syncing dirty cache entries...')
+  for (const [phone, entry] of userCache) {
+    if (entry.dirty) {
+      await syncUserToAirtable(phone)
+    }
+  }
+  console.log('Cache synced. Exiting.')
+  process.exit(0)
+})
+
 // ============================================================
 // Referral Detection & Processing
 // ============================================================
