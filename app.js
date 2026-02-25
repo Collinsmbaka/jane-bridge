@@ -106,10 +106,11 @@ async function airtableLookupUser(phone) {
   }
 }
 
-async function airtableCreateUser(phone, referrerAirtableId) {
+async function airtableCreateUser(phone, referrerAirtableId, userName) {
   const referralCode = generateReferralCode()
   const fields = {
     whatsapp_number: phone,
+    name: userName || '',
     customer_status: 'free',
     message_count: 0,
     referral_code: referralCode,
@@ -221,8 +222,8 @@ async function getOrCreateUser(phone) {
   return null
 }
 
-async function createNewUser(phone, referrerAirtableId) {
-  const userData = await airtableCreateUser(phone, referrerAirtableId)
+async function createNewUser(phone, referrerAirtableId, userName) {
+  const userData = await airtableCreateUser(phone, referrerAirtableId, userName)
   if (userData) {
     const entry = {
       ...userData,
@@ -453,7 +454,7 @@ async function processIncomingMessage(user_id, messageText, phone_number_id, use
     }
 
     // Create user in Airtable
-    user = await createNewUser(user_id, referrerAirtableId)
+    user = await createNewUser(user_id, referrerAirtableId, user_name)
     if (!user) {
       // Airtable down — forward to Voiceflow without tracking
       console.log('Airtable unavailable, forwarding without tracking')
