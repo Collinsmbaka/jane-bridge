@@ -21,6 +21,7 @@ const JANE_WHATSAPP_NUMBER = process.env.JANE_WHATSAPP_NUMBER
 const FREE_MESSAGE_LIMIT = parseInt(process.env.FREE_MESSAGE_LIMIT) || 10
 const REFERRAL_BONUS = parseInt(process.env.REFERRAL_BONUS) || 10
 const MAX_REFERRALS = parseInt(process.env.MAX_REFERRALS) || 3
+const HARD_MESSAGE_LIMIT = parseInt(process.env.HARD_MESSAGE_LIMIT) || 30
 const SHOPIFY_STORE_URL = process.env.SHOPIFY_STORE_URL || 'https://janeforwomen.com'
 const MAKE_WEBHOOK_URL = process.env.MAKE_WEBHOOK_URL || null
 
@@ -212,6 +213,7 @@ async function getOrCreateUser(phone) {
       lastSynced: Date.now(),
       lastActive: Date.now(),
       dirty: false,
+      nudgeSent: userData.message_count >= getEffectiveLimit(userData),
     }
     userCache.set(phone, entry)
     return entry
@@ -229,6 +231,7 @@ async function createNewUser(phone, referrerAirtableId) {
       lastSynced: Date.now(),
       lastActive: Date.now(),
       dirty: false,
+      nudgeSent: false,
     }
     userCache.set(phone, entry)
     return entry
@@ -342,21 +345,38 @@ async function processReferral(referralCode, newUserPhone, phone_number_id) {
 // Soft Block: Message Limit & Keyword Handling
 // ============================================================
 
-function isUserBlocked(user) {
+function isUserHardBlocked(user) {
   if (!user) return false
   if (user.customer_status === 'paying') return false
-  return user.message_count >= getEffectiveLimit(user)
+  return user.message_count >= HARD_MESSAGE_LIMIT
+}
+
+function isUserAtSoftLimit(user) {
+  if (!user) return false
+  if (user.customer_status === 'paying') return false
+  return user.message_count >= getEffectiveLimit(user) && user.message_count < HARD_MESSAGE_LIMIT
 }
 
 function buildReferralLink(referralCode) {
   return `https://wa.me/${JANE_WHATSAPP_NUMBER}?text=Hi%20Jane%20${referralCode}`
 }
 
-function buildLimitMessage(user) {
+function buildSoftNudgeMessage(user) {
   const hasReferralsLeft = (user.referrals_earned || 0) < MAX_REFERRALS
-  let msg = `You've used all your free messages with Jane!\n\nBut don't worry, here are ways to keep chatting:\n\n`
+  let msg = `Hey! You're enjoying your chat with Jane — that's great! 😊\n\nTo help us keep Jane free, please share her with a friend:\n\n`
   if (hasReferralsLeft) {
-    msg += `1️⃣ *Share with a friend* — You'll BOTH get ${REFERRAL_BONUS} more free messages!\nYour link: ${buildReferralLink(user.referral_code)}\n\n`
+    msg += `*Share with a friend* — You'll BOTH get ${REFERRAL_BONUS} more free messages!\nYour link: ${buildReferralLink(user.referral_code)}\n\n`
+  }
+  msg += `You can also unlock *unlimited messages* by getting a wellness product: ${SHOPIFY_STORE_URL}\n\n`
+  msg += `_You can keep chatting for now!_`
+  return msg
+}
+
+function buildHardBlockMessage(user) {
+  const hasReferralsLeft = (user.referrals_earned || 0) < MAX_REFERRALS
+  let msg = `You've used all your free messages with Jane!\n\nTo continue chatting:\n\n`
+  if (hasReferralsLeft) {
+    msg += `1️⃣ *Share with a friend* — Get them to chat with Jane and you'll BOTH get ${REFERRAL_BONUS} more free messages!\nYour link: ${buildReferralLink(user.referral_code)}\n\n`
     msg += `2️⃣ *Get a wellness product* — Unlock unlimited messages!\nVisit: ${SHOPIFY_STORE_URL}`
   } else {
     msg += `*Get a wellness product* — Unlock unlimited messages!\nVisit: ${SHOPIFY_STORE_URL}`
@@ -386,7 +406,7 @@ function buildReferralMessage(user) {
   return `You've used all ${MAX_REFERRALS} referral slots. To keep chatting with Jane, get a wellness product:\n${SHOPIFY_STORE_URL}`
 }
 
-async function handleSoftBlock(user, messageText, phone_number_id, from) {
+async function handleHardBlock(user, messageText, phone_number_id, from) {
   const lower = (messageText || '').toLowerCase().trim()
 
   let responseText
@@ -397,7 +417,7 @@ async function handleSoftBlock(user, messageText, phone_number_id, from) {
   } else if (lower === 'buy' || lower === 'purchase') {
     responseText = buildBuyMessage()
   } else {
-    responseText = buildLimitMessage(user)
+    responseText = buildHardBlockMessage(user)
   }
 
   await sendWhatsAppText(phone_number_id, from, responseText)
@@ -463,19 +483,22 @@ async function processIncomingMessage(user_id, messageText, phone_number_id, use
     }
   }
 
-  // Step 3: Check if blocked (free users only)
-  if (isUserBlocked(user)) {
-    await handleSoftBlock(user, messageText, phone_number_id, user_id)
+  // Step 3: Check if hard blocked (30+ messages, no referral or purchase)
+  if (isUserHardBlocked(user)) {
+    await handleHardBlock(user, messageText, phone_number_id, user_id)
     return
   }
 
-  // Step 4: Increment message count (free users only)
+  // Step 4: Check if at soft limit — send nudge but continue chatting
+  const shouldNudge = isUserAtSoftLimit(user) && !user.nudgeSent
+
+  // Step 5: Increment message count (free users only)
   if (user.customer_status !== 'paying') {
     user.message_count += 1
     user.dirty = true
     user.lastActive = Date.now()
 
-    // Step 5: Sync every 5 messages
+    // Step 6: Sync every 5 messages
     if (user.message_count % 5 === 0) {
       syncUserToAirtable(user_id).catch(err =>
         console.log('Background sync error:', err.message)
@@ -483,7 +506,13 @@ async function processIncomingMessage(user_id, messageText, phone_number_id, use
     }
   }
 
-  // Step 6: Forward to Voiceflow
+  // Step 7: Send soft nudge if they just hit the limit (once)
+  if (shouldNudge) {
+    user.nudgeSent = true
+    await sendWhatsAppText(phone_number_id, user_id, buildSoftNudgeMessage(user))
+  }
+
+  // Step 8: Forward to Voiceflow
   const request = requestBuilder(isNewUser ? cleanedText : messageText)
   await interact(user_id, request, phone_number_id, user_name, user)
 }
