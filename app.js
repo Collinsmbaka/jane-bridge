@@ -489,16 +489,13 @@ async function processIncomingMessage(user_id, messageText, phone_number_id, use
     return
   }
 
-  // Step 4: Check if at soft limit — send nudge but continue chatting
-  const shouldNudge = isUserAtSoftLimit(user) && !user.nudgeSent
-
-  // Step 5: Increment message count (free users only)
+  // Step 4: Increment message count (free users only)
   if (user.customer_status !== 'paying') {
     user.message_count += 1
     user.dirty = true
     user.lastActive = Date.now()
 
-    // Step 6: Sync every 5 messages
+    // Step 5: Sync every 5 messages
     if (user.message_count % 5 === 0) {
       syncUserToAirtable(user_id).catch(err =>
         console.log('Background sync error:', err.message)
@@ -506,8 +503,8 @@ async function processIncomingMessage(user_id, messageText, phone_number_id, use
     }
   }
 
-  // Step 7: Send soft nudge if they just hit the limit (once)
-  if (shouldNudge) {
+  // Step 6: Send soft nudge if they just hit the limit (once, after incrementing)
+  if (isUserAtSoftLimit(user) && !user.nudgeSent) {
     user.nudgeSent = true
     await sendWhatsAppText(phone_number_id, user_id, buildSoftNudgeMessage(user))
   }
