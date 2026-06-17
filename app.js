@@ -107,7 +107,7 @@ async function airtableLookupUser(phone) {
   }
 }
 
-async function airtableCreateUser(phone, referrerAirtableId) {
+async function airtableCreateUser(phone, referrerAirtableId, referral) {
   const referralCode = generateReferralCode()
   const fields = {
     whatsapp_number: phone,
@@ -120,6 +120,12 @@ async function airtableCreateUser(phone, referrerAirtableId) {
   }
   if (referrerAirtableId) {
     fields.referrer_id = [referrerAirtableId]
+  }
+  if (referral && referral.ctwa_clid) {
+    fields.ctwa_clid = referral.ctwa_clid
+    if (referral.source_id) fields.ad_id = referral.source_id
+    if (referral.headline) fields.ad_headline = referral.headline
+    fields.ctwa_captured_at = new Date().toISOString()
   }
   try {
     const res = await axios({
@@ -223,8 +229,8 @@ async function getOrCreateUser(phone) {
   return null
 }
 
-async function createNewUser(phone, referrerAirtableId) {
-  const userData = await airtableCreateUser(phone, referrerAirtableId)
+async function createNewUser(phone, referrerAirtableId, referral) {
+  const userData = await airtableCreateUser(phone, referrerAirtableId, referral)
   if (userData) {
     const entry = {
       ...userData,
@@ -239,13 +245,33 @@ async function createNewUser(phone, referrerAirtableId) {
   return null
 }
 
+// Latest-click-wins: a returning user clicking a NEW ad overwrites their stored clid.
+// Meta uses last-click attribution, so the most recent click is the one to fire CAPI against.
+function captureReferral(phone, referral) {
+  if (!referral || !referral.ctwa_clid) return
+  const user = userCache.get(phone)
+  if (!user) return
+  user.ctwa_clid = referral.ctwa_clid
+  if (referral.source_id) user.ad_id = referral.source_id
+  if (referral.headline) user.ad_headline = referral.headline
+  user.ctwa_captured_at = new Date().toISOString()
+  user.dirty = true
+  console.log(`[CTWA] captured clid for ${phone}: ${referral.ctwa_clid} (ad ${referral.source_id || 'unknown'})`)
+}
+
 async function syncUserToAirtable(phone) {
   const user = userCache.get(phone)
   if (!user || !user.airtable_id) return
-  await airtableUpdateUser(user.airtable_id, {
+  const fields = {
     message_count: user.message_count,
     last_active: new Date().toISOString(),
-  })
+  }
+  // Only include CTWA fields when present — never overwrite Airtable values with empty strings.
+  if (user.ctwa_clid) fields.ctwa_clid = user.ctwa_clid
+  if (user.ad_id) fields.ad_id = user.ad_id
+  if (user.ad_headline) fields.ad_headline = user.ad_headline
+  if (user.ctwa_captured_at) fields.ctwa_captured_at = user.ctwa_captured_at
+  await airtableUpdateUser(user.airtable_id, fields)
   user.lastSynced = Date.now()
   user.dirty = false
 }
@@ -452,7 +478,7 @@ async function sendWhatsAppText(phone_number_id, to, text) {
 // Main Message Processing (pre-Voiceflow)
 // ============================================================
 
-async function processIncomingMessage(user_id, messageText, phone_number_id, user_name, requestBuilder) {
+async function processIncomingMessage(user_id, messageText, phone_number_id, user_name, requestBuilder, referral) {
   // Step 1: Get or create user
   let user = await getOrCreateUser(user_id)
   let isNewUser = false
@@ -472,8 +498,8 @@ async function processIncomingMessage(user_id, messageText, phone_number_id, use
       }
     }
 
-    // Create user in Airtable
-    user = await createNewUser(user_id, referrerAirtableId)
+    // Create user in Airtable — CTWA referral lands in the initial POST
+    user = await createNewUser(user_id, referrerAirtableId, referral)
     if (!user) {
       // Airtable down — forward to Voiceflow without tracking
       console.log('Airtable unavailable, forwarding without tracking')
@@ -481,6 +507,9 @@ async function processIncomingMessage(user_id, messageText, phone_number_id, use
       await interact(user_id, request, phone_number_id, user_name, null)
       return
     }
+  } else {
+    // Existing user — capture latest ad click into cache; sync handles persistence
+    captureReferral(user_id, referral)
   }
 
   // Step 3: Check if hard blocked (30+ messages, no referral or purchase)
@@ -547,6 +576,10 @@ app.post('/webhook', async (req, res) => {
       let user_name =
         req.body.entry[0].changes[0].value.contacts[0].profile.name
 
+      // CTWA referral: present only on the first message after an ad click (and sometimes
+      // on follow-ups in the same session). Captured unconditionally — guarded downstream.
+      const referral = req.body.entry[0].changes[0].value.messages[0].referral || null
+
       if (req.body.entry[0].changes[0].value.messages[0].text) {
         const messageText = req.body.entry[0].changes[0].value.messages[0].text.body
         await processIncomingMessage(
@@ -554,7 +587,8 @@ app.post('/webhook', async (req, res) => {
           messageText,
           phone_number_id,
           user_name,
-          (text) => ({ type: 'text', payload: text })
+          (text) => ({ type: 'text', payload: text }),
+          referral
         )
       } else if (req.body?.entry[0]?.changes[0]?.value?.messages[0]?.audio) {
         if (
@@ -598,7 +632,8 @@ app.post('/webhook', async (req, res) => {
                   transcript,
                   phone_number_id,
                   user_name,
-                  (text) => ({ type: 'text', payload: text })
+                  (text) => ({ type: 'text', payload: text }),
+                  referral
                 )
               }
             })
@@ -619,7 +654,8 @@ app.post('/webhook', async (req, res) => {
             () => ({
               type: buttonId,
               payload: { label: buttonTitle },
-            })
+            }),
+            referral
           )
         } else {
           await processIncomingMessage(
@@ -634,7 +670,8 @@ app.post('/webhook', async (req, res) => {
                 intent: { name: buttonId },
                 entities: [],
               },
-            })
+            }),
+            referral
           )
         }
       }
