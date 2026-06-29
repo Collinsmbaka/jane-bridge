@@ -639,41 +639,49 @@ app.post('/webhook', async (req, res) => {
             })
           })
         }
-      } else {
-        // Interactive button replies
+      } else if (req.body.entry[0].changes[0].value.messages[0].interactive) {
         const interactiveMsg = req.body.entry[0].changes[0].value.messages[0].interactive
-        const buttonId = interactiveMsg.button_reply.id
-        const buttonTitle = interactiveMsg.button_reply.title
-
-        if (buttonId.includes('path-')) {
-          await processIncomingMessage(
-            user_id,
-            buttonTitle,
-            phone_number_id,
-            user_name,
-            () => ({
-              type: buttonId,
-              payload: { label: buttonTitle },
-            }),
-            referral
-          )
+        // Handle both button_reply and list_reply; gracefully ignore anything else.
+        const reply = interactiveMsg.button_reply || interactiveMsg.list_reply
+        if (!reply) {
+          console.log('Interactive message without button/list reply, ignoring:', JSON.stringify(interactiveMsg))
         } else {
-          await processIncomingMessage(
-            user_id,
-            buttonTitle,
-            phone_number_id,
-            user_name,
-            () => ({
-              type: 'intent',
-              payload: {
-                query: buttonTitle,
-                intent: { name: buttonId },
-                entities: [],
-              },
-            }),
-            referral
-          )
+          const buttonId = reply.id
+          const buttonTitle = reply.title
+
+          if (buttonId.includes('path-')) {
+            await processIncomingMessage(
+              user_id,
+              buttonTitle,
+              phone_number_id,
+              user_name,
+              () => ({
+                type: buttonId,
+                payload: { label: buttonTitle },
+              }),
+              referral
+            )
+          } else {
+            await processIncomingMessage(
+              user_id,
+              buttonTitle,
+              phone_number_id,
+              user_name,
+              () => ({
+                type: 'intent',
+                payload: {
+                  query: buttonTitle,
+                  intent: { name: buttonId },
+                  entities: [],
+                },
+              }),
+              referral
+            )
+          }
         }
+      } else {
+        // Reactions, media, location, contacts, etc. — log and drop, don't crash.
+        console.log(`Ignoring unsupported message type: ${req.body.entry[0].changes[0].value.messages[0].type}`)
       }
     }
     res.status(200).json({ message: 'ok' })
