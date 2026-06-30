@@ -25,6 +25,13 @@ const HARD_MESSAGE_LIMIT = parseInt(process.env.HARD_MESSAGE_LIMIT) || 30
 const SHOPIFY_STORE_URL = process.env.SHOPIFY_STORE_URL || 'https://janeforwomen.com'
 const MAKE_WEBHOOK_URL = process.env.MAKE_WEBHOOK_URL || null
 
+// Meta CAPI configuration (Lead event firing for CTWA attribution)
+const META_CAPI_TOKEN = process.env.META_CAPI_TOKEN
+const META_DATASET_ID = process.env.META_DATASET_ID
+const META_WABA_ID = process.env.META_WABA_ID
+const META_GRAPH_VERSION = process.env.META_GRAPH_VERSION || 'v22.0'
+const QUALIFY_SHARED_SECRET = process.env.QUALIFY_SHARED_SECRET
+
 // Validate user_id: allow only E.164-like phone numbers (optional +, 8-15 digits)
 function isValidUserId(user_id) {
   return typeof user_id === "string" && /^\+?[1-9]\d{7,14}$/.test(user_id);
@@ -98,6 +105,8 @@ async function airtableLookupUser(phone) {
         customer_status: rec.fields.customer_status || 'free',
         referral_code: rec.fields.referral_code || null,
         referrals_earned: rec.fields.referrals_earned || 0,
+        ctwa_clid: rec.fields.ctwa_clid || null,
+        lead_event_fired_at: rec.fields.lead_event_fired_at || null,
       }
     }
     return null
@@ -475,6 +484,43 @@ async function sendWhatsAppText(phone_number_id, to, text) {
 }
 
 // ============================================================
+// Meta CAPI — Lead event firing for CTWA qualification
+// ============================================================
+
+// Strip non-digits; convert leading 0 to 234 (Nigerian E.164 without plus).
+// Voiceflow sends the raw WhatsApp `from` (already E.164-no-plus) → this is a no-op.
+// External callers may send +234, 0801..., 0801 234..., etc. → normalize.
+function normalizePhone(raw) {
+  if (!raw) return null
+  const digits = String(raw).replace(/\D/g, '')
+  if (digits.length === 0) return null
+  if (digits.startsWith('0')) return '234' + digits.slice(1)
+  return digits
+}
+
+async function fireMetaCapiLead(user) {
+  const url = `https://graph.facebook.com/${META_GRAPH_VERSION}/${META_DATASET_ID}/events?access_token=${META_CAPI_TOKEN}`
+  const payload = {
+    data: [{
+      event_name: 'Lead',
+      event_time: Math.floor(Date.now() / 1000),
+      event_id: user.airtable_id,
+      action_source: 'business_messaging',
+      messaging_channel: 'whatsapp',
+      user_data: {
+        whatsapp_business_account_id: META_WABA_ID,
+        ctwa_clid: user.ctwa_clid,
+      },
+    }],
+  }
+  const res = await axios.post(url, payload, {
+    headers: { 'Content-Type': 'application/json' },
+    validateStatus: () => true,
+  })
+  return { ok: res.status >= 200 && res.status < 300, status: res.status, data: res.data }
+}
+
+// ============================================================
 // Main Message Processing (pre-Voiceflow)
 // ============================================================
 
@@ -557,6 +603,68 @@ app.get('/', (req, res) => {
     cache_size: userCache.size,
     error: null,
   })
+})
+
+// CTWA qualification trigger — called by Voiceflow (product/booking-link ask)
+// and any future internal source (e.g., jane-book on paid booking).
+// Fires a Meta CAPI Lead event once per user, gated by Airtable lead_event_fired_at.
+// Always returns 200 to match the fire-and-forget caller contract.
+app.post('/qualify', async (req, res) => {
+  if (!QUALIFY_SHARED_SECRET || req.headers['x-internal-token'] !== QUALIFY_SHARED_SECRET) {
+    return res.status(401).json({ message: 'unauthorized' })
+  }
+
+  if (!META_CAPI_TOKEN || !META_DATASET_ID || !META_WABA_ID) {
+    console.log('[qualify] Meta CAPI not configured — skipping')
+    return res.status(200).json({ message: 'meta_not_configured' })
+  }
+
+  const { phone, source } = req.body || {}
+  const normalized = normalizePhone(phone)
+  if (!normalized) {
+    return res.status(400).json({ message: 'invalid_phone' })
+  }
+
+  const user = await airtableLookupUser(normalized)
+  if (!user) {
+    console.log(`[qualify] no_match ${normalized} (source: ${source})`)
+    return res.status(200).json({ message: 'no_match' })
+  }
+
+  if (user.lead_event_fired_at) {
+    console.log(`[qualify] already_fired ${normalized} (source: ${source})`)
+    return res.status(200).json({ message: 'already_fired' })
+  }
+
+  if (!user.ctwa_clid) {
+    console.log(`[qualify] no_ctwa ${normalized} (source: ${source})`)
+    return res.status(200).json({ message: 'no_ctwa' })
+  }
+
+  let result
+  try {
+    result = await fireMetaCapiLead(user)
+  } catch (err) {
+    console.log(`[qualify] capi_error ${normalized}:`, err.message)
+    return res.status(200).json({ message: 'capi_error' })
+  }
+
+  if (!result.ok) {
+    console.log(`[qualify] capi_${result.status} ${normalized}:`, JSON.stringify(result.data))
+    return res.status(200).json({ message: 'capi_failed' })
+  }
+
+  // Persist the flag directly to Airtable. Cache may be stale but won't double-fire
+  // because the next /qualify does a fresh airtableLookupUser read (see above).
+  try {
+    await airtableUpdateUser(user.airtable_id, { lead_event_fired_at: new Date().toISOString() })
+  } catch (err) {
+    console.log(`[qualify] flag_persist_failed ${normalized}:`, err.message)
+    // CAPI already fired — Meta's event_id dedup (7-day window) protects against re-fire
+  }
+
+  console.log(`[qualify] fired Lead ${normalized} (source: ${source}, airtable_id: ${user.airtable_id})`)
+  return res.status(200).json({ message: 'lead_fired' })
 })
 
 // Accepts POST requests at /webhook endpoint
@@ -722,6 +830,7 @@ async function interact(user_id, request, phone_number_id, user_name, cachedUser
   const variables = {
     user_id: cachedUser ? cachedUser.airtable_id : user_id,
     user_name: user_name,
+    whatsapp_phone: user_id,
   }
   if (cachedUser) {
     variables.customer_status = cachedUser.customer_status
