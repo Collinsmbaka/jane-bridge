@@ -502,7 +502,7 @@ async function fireMetaCapiLead(user) {
   const url = `https://graph.facebook.com/${META_GRAPH_VERSION}/${META_DATASET_ID}/events?access_token=${META_CAPI_TOKEN}`
   const payload = {
     data: [{
-      event_name: 'Lead',
+      event_name: 'LeadSubmitted',
       event_time: Math.floor(Date.now() / 1000),
       event_id: user.airtable_id,
       action_source: 'business_messaging',
